@@ -5,654 +5,1097 @@ from pathlib import Path
 import random
 import tempfile
 import warnings
+import os
+import atexit
 from datetime import datetime
 import traceback
+import threading
+import logging
+import time
+import sys
+import math
+import json
+from typing import Optional, Tuple, Dict, Any, List
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from stl import mesh
+
 warnings.filterwarnings('ignore')
 
-# ==================== КОНСТАНТЫ ====================
-PREDEFINED_SHAPES = ["Сердце", "Звезда", "Круг", "Квадрат", "Треугольник", "Спираль"]
-IMAGE_SIZE = 400
-CELL_SIZE = 8  # Увеличил для лучшего качества
-MODEL_PATH = "FastSAM-s.pt"
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('maze_generator.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# ==================== УЛУЧШЕННЫЙ ГЕНЕРАТОР ЛАБИРИНТА ====================
+# Константы
+PREDEFINED_SHAPES = ["Звезда", "Круг", "Квадрат", "Треугольник", "Овал", "Многоугольник", "Кольцо", "Ромб", "Восьмиугольник"]
+DEFAULT_IMAGE_SIZE = 800
+DEFAULT_WALL_WIDTH_MM = 3.0
+DEFAULT_WALL_HEIGHT_MM = 15.0
+DEFAULT_BASE_HEIGHT_MM = 2.0
+MAX_MAZE_SIZE = 1500  # Максимальный размер лабиринта
+MAX_TEMP_FILES = 20   # Максимальное количество временных файлов
+
+# Простой генератор лабиринта
 class MazeGenerator:
     def __init__(self):
         self.directions = [(0, -2), (2, 0), (0, 2), (-2, 0)]
     
-    def _validate_mask(self, mask):
-        """Проверяет и очищает маску"""
-        if mask is None or mask.size == 0:
-            return None
-        # Убеждаемся, что маска бинарная
-        if mask.dtype != bool:
-            mask = mask > 0
-        # Удаляем мелкие шумы
-        from scipy import ndimage
-        labeled, num_features = ndimage.label(mask)
-        if num_features == 0:
-            return None
+    def generate_maze_in_mask(self, mask: np.ndarray, wall_width_pixels: int = 2) -> np.ndarray:
+        """Генерация лабиринта внутри маски"""
+        h, w = mask.shape
         
-        # Оставляем только самую большую компоненту
-        sizes = ndimage.sum(mask, labeled, range(num_features + 1))
-        largest_label = np.argmax(sizes[1:]) + 1
-        mask_clean = labeled == largest_label
+        # Ограничиваем размер для производительности
+        if h > MAX_MAZE_SIZE or w > MAX_MAZE_SIZE:
+            scale = MAX_MAZE_SIZE / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            mask = cv2.resize(mask.astype(np.uint8), (new_w, new_h), 
+                             interpolation=cv2.INTER_AREA) > 0
+            h, w = mask.shape
+            logger.info(f"Маска масштабирована до {h}x{w}")
         
-        # Заливаем мелкие дырки
-        mask_clean = ndimage.binary_fill_holes(mask_clean)
+        # Создаем сетку для лабиринта
+        cell_size = max(3, min(h, w) // 80)  # Увеличиваем ячейки для скорости
+        grid_h = h // cell_size
+        grid_w = w // cell_size
         
-        return mask_clean
-    
-    def _get_start_point(self, mask, grid_h, grid_w):
-        """Находит лучшую стартовую точку в центре маски"""
-        # Ищем центр масс маски
-        from scipy import ndimage
-        center_y, center_x = ndimage.center_of_mass(mask)
-        center_y, center_x = int(center_y * grid_h / mask.shape[0]), int(center_x * grid_w / mask.shape[1])
+        if grid_h < 3 or grid_w < 3:
+            grid_h = max(3, h // 4)
+            grid_w = max(3, w // 4)
+            cell_size = min(h // grid_h, w // grid_w)
         
-        # Ищем ближайшую допустимую точку
-        start_y, start_x = max(1, min(center_y, grid_h - 2)), max(1, min(center_x, grid_w - 2))
+        # Масштабируем маску
+        scaled_mask = cv2.resize(mask.astype(np.uint8), (grid_w, grid_h), 
+                                interpolation=cv2.INTER_AREA) > 0
         
-        # Проверяем окрестности если точка невалидна
-        for dy in range(-2, 3):
-            for dx in range(-2, 3):
-                y, x = start_y + dy, start_x + dx
-                if 1 <= y < grid_h - 1 and 1 <= x < grid_w - 1:
-                    if mask[int(y * mask.shape[0] / grid_h), int(x * mask.shape[1] / grid_w)]:
-                        return (y, x)
+        # Инициализируем лабиринт
+        maze_grid = np.ones((grid_h, grid_w), dtype=np.uint8)
         
-        return (start_y, start_x)
-    
-    def generate_inside_mask(self, binary_mask, cell_size=CELL_SIZE):
-        """Генерирует качественный лабиринт внутри бинарной маски"""
-        try:
-            from scipy import ndimage
+        # Находим доступные ячейки
+        available_cells = np.argwhere(scaled_mask)
+        
+        if len(available_cells) == 0:
+            # Создаем простой лабиринт
+            maze_grid[1:-1, 1:-1] = 0
+            scaled_mask[1:-1, 1:-1] = True
+        
+        # Выбираем случайную начальную точку
+        if len(available_cells) > 0:
+            start_idx = random.randint(0, len(available_cells) - 1)
+            start_y, start_x = available_cells[start_idx]
+        else:
+            start_y, start_x = 1, 1
+        
+        # Алгоритм Prim для скорости
+        maze_grid[start_y, start_x] = 0
+        frontiers = []
+        
+        for dy, dx in self.directions:
+            ny, nx = start_y + dy, start_x + dx
+            my, mx = start_y + dy // 2, start_x + dx // 2
+            if (0 <= ny < grid_h and 0 <= nx < grid_w and
+                0 <= my < grid_h and 0 <= mx < grid_w and
+                scaled_mask[ny, nx] and maze_grid[ny, nx] == 1):
+                frontiers.append((ny, nx, my, mx))
+        
+        while frontiers:
+            idx = random.randint(0, len(frontiers) - 1)
+            y, x, my, mx = frontiers.pop(idx)
             
-            # Валидация и очистка маски
-            binary_mask = self._validate_mask(binary_mask)
-            if binary_mask is None or not np.any(binary_mask):
-                raise ValueError("Маска пустая или невалидная")
-            
-            h, w = binary_mask.shape
-            
-            # Рассчитываем размер сетки для лабиринта
-            grid_h = max(10, h // cell_size)
-            grid_w = max(10, w // cell_size)
-            
-            # Создаем масштабированную маску с улучшенным качеством
-            scale_y, scale_x = grid_h / h, grid_w / w
-            
-            # Используем режим 'constant' для сохранения формы
-            scaled_mask = ndimage.zoom(
-                binary_mask.astype(float), 
-                (scale_y, scale_x), 
-                order=0,  # Порядок 0 сохраняет четкие границы
-                mode='constant',
-                cval=0.0
-            ) > 0.5
-            
-            # Улучшаем маску
-            kernel = np.ones((3, 3), np.uint8)
-            scaled_mask = ndimage.binary_erosion(scaled_mask, structure=kernel, iterations=1)
-            scaled_mask = ndimage.binary_dilation(scaled_mask, structure=kernel, iterations=2)
-            scaled_mask = ndimage.binary_fill_holes(scaled_mask)
-            
-            # Создаем лабиринт
-            maze = np.ones((grid_h, grid_w), dtype=np.uint8)
-            
-            # Находим лучшую стартовую точку
-            start = self._get_start_point(scaled_mask, grid_h, grid_w)
-            
-            # Проверяем, что стартовая точка внутри маски
-            start_y, start_x = start
-            if not (0 <= start_y < grid_h and 0 <= start_x < grid_w and scaled_mask[start_y, start_x]):
-                # Ищем первую подходящую точку
-                points = np.argwhere(scaled_mask)
-                if len(points) == 0:
-                    raise ValueError("Нет подходящих точек для старта")
-                start = tuple(points[0])
-            
-            stack = [start]
-            maze[start] = 0
-            
-            # Генерируем лабиринт с улучшенным алгоритмом
-            while stack:
-                y, x = stack[-1]
-                random.shuffle(self.directions)
-                moved = False
+            if maze_grid[y, x] == 1:
+                maze_grid[y, x] = 0
+                maze_grid[my, mx] = 0
                 
-                # Проверяем все направления
-                possible_moves = []
                 for dy, dx in self.directions:
                     ny, nx = y + dy, x + dx
-                    my, mx = y + dy // 2, x + dx // 2
-                    
+                    nmy, nmx = y + dy // 2, x + dx // 2
                     if (0 <= ny < grid_h and 0 <= nx < grid_w and
-                        0 <= my < grid_h and 0 <= mx < grid_w and
-                        scaled_mask[ny, nx] and maze[ny, nx] == 1):
-                        possible_moves.append((dy, dx, ny, nx, my, mx))
-                
-                # Если есть возможные ходы, выбираем случайный
-                if possible_moves:
-                    dy, dx, ny, nx, my, mx = random.choice(possible_moves)
-                    maze[my, mx] = 0
-                    maze[ny, nx] = 0
-                    stack.append((ny, nx))
-                    moved = True
-                
-                if not moved:
-                    stack.pop()
-            
-            # Масштабируем лабиринт обратно
-            maze_fullsize = ndimage.zoom(
-                maze, 
-                (h / grid_h, w / grid_w), 
-                order=0,
-                mode='constant',
-                cval=1.0
-            )
-            
-            # Обрезаем до исходного размера
-            maze_fullsize = maze_fullsize[:h, :w]
-            
-            # Применяем исходную маску
-            maze_fullsize = np.where(binary_mask, maze_fullsize, 1)
-            
-            # Улучшаем качество границ
-            maze_fullsize = ndimage.binary_dilation(maze_fullsize == 0, iterations=1).astype(np.uint8)
-            maze_fullsize = ndimage.binary_erosion(maze_fullsize == 1, iterations=1).astype(np.uint8)
-            
-            return maze_fullsize
-            
-        except Exception as e:
-            print(f"Ошибка генерации лабиринта: {e}")
-            traceback.print_exc()
-            raise
+                        0 <= nmy < grid_h and 0 <= nmx < grid_w and
+                        scaled_mask[ny, nx] and maze_grid[ny, nx] == 1):
+                        frontiers.append((ny, nx, nmy, nmx))
+        
+        # Масштабируем обратно
+        maze = cv2.resize(maze_grid.astype(np.float32), (w, h), 
+                         interpolation=cv2.INTER_NEAREST)
+        maze = (maze > 0.5).astype(np.uint8)
+        
+        # Применяем маску
+        maze = np.where(mask, maze, 1)
+        
+        return maze
 
-# ==================== УЛУЧШЕННАЯ БАЗА ФОРМ ====================
-class ShapeDatabase:
+# Генератор масок
+class MaskGenerator:
     @staticmethod
-    def create_heart_mask(width=IMAGE_SIZE, height=IMAGE_SIZE):
-        """Создает маску сердца с улучшенным качеством"""
-        mask = np.zeros((height, width), dtype=bool)
-        center_x, center_y = width // 2, height // 2
-        size = min(width, height) // 3
+    def create_shape_mask(shape_name: str, size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
+        """Создание маски для выбранной формы"""
+        # Ограничиваем размер
+        size = min(size, MAX_MAZE_SIZE)
         
-        y, x = np.ogrid[-center_y:height-center_y, -center_x:width-center_x]
+        mask = np.zeros((size, size), dtype=bool)
+        center_x, center_y = size // 2, size // 2
         
-        # Уравнение сердца
-        heart_eq = (x**2 + (1.2*y - np.sqrt(np.abs(x)))**2 - size**2) < 0
+        shape_lower = shape_name.lower()
         
-        mask[heart_eq] = True
+        if any(word in shape_lower for word in ['звезда', 'star']):
+            img = Image.new('L', (size, size), 0)
+            draw = ImageDraw.Draw(img)
+            
+            points = 5
+            outer_radius = size * 0.4
+            inner_radius = outer_radius * 0.4
+            
+            star_points = []
+            for i in range(points * 2):
+                angle = np.pi / 2 + i * np.pi / points
+                radius = inner_radius if i % 2 == 1 else outer_radius
+                x = center_x + radius * math.cos(angle)
+                y = center_y + radius * math.sin(angle)
+                star_points.append((x, y))
+            
+            draw.polygon(star_points, fill=255)
+            mask = np.array(img) > 127
         
-        # Сглаживание
-        from scipy import ndimage
-        mask = ndimage.binary_closing(mask, structure=np.ones((5, 5)))
-        mask = ndimage.binary_fill_holes(mask)
+        elif any(word in shape_lower for word in ['круг', 'circle']):
+            radius = size * 0.4
+            y, x = np.ogrid[-center_y:size-center_y, -center_x:size-center_x]
+            mask = x**2 + y**2 <= radius**2
+        
+        elif any(word in shape_lower for word in ['квадрат', 'square']):
+            margin = size // 5
+            mask[margin:size-margin, margin:size-margin] = True
+        
+        elif any(word in shape_lower for word in ['треугольник', 'triangle']):
+            pts = np.array([
+                [center_x, size // 4],
+                [size // 4, 3 * size // 4],
+                [3 * size // 4, 3 * size // 4]
+            ], np.int32)
+            mask_img = np.zeros((size, size), dtype=np.uint8)
+            cv2.fillPoly(mask_img, [pts], 255)
+            mask = mask_img > 127
+        
+        elif any(word in shape_lower for word in ['овал', 'oval', 'эллипс']):
+            radius_x = size * 0.35
+            radius_y = size * 0.25
+            y, x = np.ogrid[-center_y:size-center_y, -center_x:size-center_x]
+            mask = (x**2 / radius_x**2) + (y**2 / radius_y**2) <= 1
+        
+        elif any(word in shape_lower for word in ['многоугольник', 'polygon']):
+            sides = 6
+            img = Image.new('L', (size, size), 0)
+            draw = ImageDraw.Draw(img)
+            
+            radius = size * 0.4
+            points = []
+            for i in range(sides):
+                angle = 2 * np.pi * i / sides
+                x = center_x + radius * math.cos(angle)
+                y = center_y + radius * math.sin(angle)
+                points.append((x, y))
+            
+            draw.polygon(points, fill=255)
+            mask = np.array(img) > 127
+        
+        elif any(word in shape_lower for word in ['кольцо', 'ring']):
+            inner_radius = size * 0.2
+            outer_radius = size * 0.4
+            y, x = np.ogrid[-center_y:size-center_y, -center_x:size-center_x]
+            r = np.sqrt(x**2 + y**2)
+            mask = (r >= inner_radius) & (r <= outer_radius)
+        
+        elif any(word in shape_lower for word in ['ромб', 'diamond']):
+            pts = np.array([
+                [center_x, size // 4],
+                [size // 4, center_y],
+                [center_x, 3 * size // 4],
+                [3 * size // 4, center_y]
+            ], np.int32)
+            mask_img = np.zeros((size, size), dtype=np.uint8)
+            cv2.fillPoly(mask_img, [pts], 255)
+            mask = mask_img > 127
+        
+        elif any(word in shape_lower for word in ['восьмиугольник', 'octagon']):
+            img = Image.new('L', (size, size), 0)
+            draw = ImageDraw.Draw(img)
+            
+            radius = size * 0.4
+            points = []
+            for i in range(8):
+                angle = 2 * np.pi * i / 8
+                x = center_x + radius * math.cos(angle)
+                y = center_y + radius * math.sin(angle)
+                points.append((x, y))
+            
+            draw.polygon(points, fill=255)
+            mask = np.array(img) > 127
+        
+        else:
+            radius = size * 0.4
+            y, x = np.ogrid[-center_y:size-center_y, -center_x:size-center_x]
+            mask = x**2 + y**2 <= radius**2
+        
+        # Улучшаем маску
+        mask = mask.astype(np.uint8) * 255
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = mask > 127
         
         return mask
-    
-    @staticmethod
-    def create_star_mask(width=IMAGE_SIZE, height=IMAGE_SIZE, points=5):
-        """Создает маску звезды с улучшенным качеством"""
-        mask = np.zeros((height, width), dtype=bool)
-        center_x, center_y = width // 2, height // 2
-        radius = min(width, height) // 2.5
-        
-        # Создаем полярную сетку
-        y, x = np.ogrid[-center_y:height-center_y, -center_x:width-center_x]
-        r = np.sqrt(x**2 + y**2)
-        theta = np.arctan2(y, x)
-        
-        # Формула для звезды
-        star_r = radius * (1 + 0.5 * np.sin(points * theta)) / (1 + 0.5)
-        
-        mask[r < star_r] = True
-        
-        # Улучшаем качество
-        from scipy import ndimage
-        mask = ndimage.binary_closing(mask, structure=np.ones((3, 3)))
-        mask = ndimage.binary_fill_holes(mask)
-        
-        return mask
-    
-    @staticmethod
-    def create_circle_mask(width=IMAGE_SIZE, height=IMAGE_SIZE):
-        mask = np.zeros((height, width), dtype=bool)
-        center_x, center_y = width // 2, height // 2
-        radius = min(width, height) // 3
-        
-        y, x = np.ogrid[-center_y:height-center_y, -center_x:width-center_x]
-        mask[x**2 + y**2 <= radius**2] = True
-        
-        return mask
-    
-    @staticmethod
-    def create_square_mask(width=IMAGE_SIZE, height=IMAGE_SIZE):
-        mask = np.zeros((height, width), dtype=bool)
-        margin = min(width, height) // 4
-        mask[margin:height-margin, margin:width-margin] = True
-        return mask
-    
-    @staticmethod
-    def create_triangle_mask(width=IMAGE_SIZE, height=IMAGE_SIZE):
-        mask = np.zeros((height, width), dtype=bool)
-        
-        # Вершины треугольника
-        vertices = np.array([
-            [width // 2, height // 4],           # Верх
-            [width // 4, 3 * height // 4],       # Левый низ
-            [3 * width // 4, 3 * height // 4]    # Правый низ
-        ])
-        
-        # Создаем сетку точек
-        x, y = np.meshgrid(np.arange(width), np.arange(height))
-        points = np.stack([x.ravel(), y.ravel()], axis=1)
-        
-        # Проверяем, находится ли точка внутри треугольника
-        def point_in_triangle(pt, v1, v2, v3):
-            d1 = np.sign((pt[0] - v2[0]) * (v1[1] - v2[1]) - (v1[0] - v2[0]) * (pt[1] - v2[1]))
-            d2 = np.sign((pt[0] - v3[0]) * (v2[1] - v3[1]) - (v2[0] - v3[0]) * (pt[1] - v3[1]))
-            d3 = np.sign((pt[0] - v1[0]) * (v3[1] - v1[1]) - (v3[0] - v1[0]) * (pt[1] - v1[1]))
-            return (d1 >= 0 and d2 >= 0 and d3 >= 0) or (d1 <= 0 and d2 <= 0 and d3 <= 0)
-        
-        # Применяем проверку ко всем точкам
-        for i, point in enumerate(points):
-            if point_in_triangle(point, vertices[0], vertices[1], vertices[2]):
-                mask[point[1], point[0]] = True
-        
-        # Улучшаем качество
-        from scipy import ndimage
-        mask = ndimage.binary_fill_holes(mask)
-        
-        return mask
-    
-    @staticmethod
-    def create_spiral_mask(width=IMAGE_SIZE, height=IMAGE_SIZE):
-        """Создает маску спирали с улучшенным качеством"""
-        mask = np.zeros((height, width), dtype=bool)
-        center_x, center_y = width // 2, height // 2
-        max_radius = min(width, height) // 2 - 20
-        
-        # Создаем спираль с несколькими витками
-        y, x = np.ogrid[-center_y:height-center_y, -center_x:width-center_x]
-        r = np.sqrt(x**2 + y**2)
-        theta = np.arctan2(y, x)
-        
-        # Уравнение спирали
-        spiral_r = 10 + (max_radius / (4 * np.pi)) * (theta + 4 * np.pi)
-        
-        # Толщина линии
-        thickness = 8
-        mask[np.abs(r - spiral_r) < thickness] = True
-        
-        # Улучшаем качество
-        from scipy import ndimage
-        mask = ndimage.binary_dilation(mask, structure=np.ones((3, 3)))
-        mask = ndimage.binary_fill_holes(mask)
-        
-        return mask
-    
-    @classmethod
-    def get_mask(cls, shape_name):
-        shape_name = shape_name.lower()
-        if 'сердц' in shape_name or 'heart' in shape_name:
-            return cls.create_heart_mask()
-        elif 'звезд' in shape_name or 'star' in shape_name:
-            return cls.create_star_mask()
-        elif 'круг' in shape_name or 'circle' in shape_name:
-            return cls.create_circle_mask()
-        elif 'квадрат' in shape_name or 'square' in shape_name:
-            return cls.create_square_mask()
-        elif 'треуголь' in shape_name or 'triangle' in shape_name:
-            return cls.create_triangle_mask()
-        elif 'спирал' in shape_name or 'spiral' in shape_name:
-            return cls.create_spiral_mask()
-        return cls.create_heart_mask()
 
-# ==================== УЛУЧШЕННЫЙ FASTSAM ОБРАБОТЧИК ====================
-class FastSAMProcessor:
-    def __init__(self, model_path=MODEL_PATH):
-        self.model_path = model_path
-        self.model = None
-        self.load_model()
+# Оптимизированный генератор STL
+class OptimizedSTLGenerator:
+    """Оптимизированный генератор STL с объединением стен"""
     
-    def load_model(self):
-        """Загружает модель FastSAM"""
+    @staticmethod
+    def maze_to_stl_optimized(maze: np.ndarray, 
+                             wall_height_mm: float = 15.0,
+                             wall_width_mm: float = 3.0,
+                             base_height_mm: float = 2.0,
+                             scale_factor: float = 1.0) -> Optional[mesh.Mesh]:
+        """Создание оптимизированной 3D модели STL из лабиринта"""
         try:
-            from ultralytics import FastSAM
-            if Path(self.model_path).exists():
-                self.model = FastSAM(self.model_path)
-                print(f"✅ FastSAM модель загружена из {self.model_path}")
-            else:
-                print(f"⚠️ Файл модели не найден: {self.model_path}")
-                print("📥 Скачайте модель FastSAM-s.pt:")
-                print("https://github.com/CASIA-IVA-Lab/FastSAM/releases/download/v0.1/FastSAM-s.pt")
-                self.model = None
-        except ImportError:
-            print("❌ Установите ultralytics: pip install ultralytics")
-            self.model = None
-        except Exception as e:
-            print(f"❌ Ошибка загрузки модели: {e}")
-            self.model = None
-    
-    def process_image(self, image):
-        """Обрабатывает изображение и возвращает маску"""
-        if self.model is None:
-            print("⚠️ Модель FastSAM не загружена!")
-            return None
-        
-        if image is None:
-            print("⚠️ Изображение не предоставлено!")
-            return None
-        
-        try:
-            # Конвертируем изображение в RGB
-            if len(image.shape) == 3:
-                if image.shape[2] == 4:  # RGBA
-                    image_rgb = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-                else:  # RGB или BGR
-                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            else:  # Grayscale
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            # Масштабируем параметры
+            wall_height = wall_height_mm * scale_factor
+            wall_width = wall_width_mm * scale_factor
+            base_height = base_height_mm * scale_factor
             
-            # Изменяем размер для обработки
-            h, w = image_rgb.shape[:2]
-            target_size = max(640, min(h, w, 1024))
+            h, w = maze.shape
             
-            # Обработка через FastSAM
-            results = self.model(
-                image_rgb, 
-                device="cpu", 
-                imgsz=target_size,
-                conf=0.25,  # Более низкий порог для лучшего обнаружения
-                iou=0.7,
-                retina_masks=True
-            )
+            # Автоматическая корректировка размера для печати
+            max_model_size = 300  # мм
+            if w * wall_width > max_model_size:
+                wall_width = max_model_size / w
+                logger.info(f"Ширина стен скорректирована до {wall_width:.2f} мм для печати")
             
-            masks = results[0].masks
-            if masks is None or len(masks) == 0:
-                print("⚠️ FastSAM не нашел объектов на изображении")
+            # Все вершины и грани
+            all_vertices = []
+            all_faces = []
+            
+            # 1. Добавляем основание (один большой прямоугольник)
+            base_vertices = [
+                [0, 0, 0],
+                [w * wall_width, 0, 0],
+                [w * wall_width, h * wall_width, 0],
+                [0, h * wall_width, 0],
+                [0, 0, base_height],
+                [w * wall_width, 0, base_height],
+                [w * wall_width, h * wall_width, base_height],
+                [0, h * wall_width, base_height]
+            ]
+            
+            base_faces = [
+                [0, 3, 1], [1, 3, 2],  # низ
+                [4, 5, 7], [5, 6, 7],  # верх
+                [0, 1, 4], [1, 5, 4],  # бок 1
+                [1, 2, 5], [2, 6, 5],  # бок 2
+                [2, 3, 6], [3, 7, 6],  # бок 3
+                [3, 0, 7], [0, 4, 7]   # бок 4
+            ]
+            
+            all_vertices.extend(base_vertices)
+            all_faces.extend(base_faces)
+            
+            # 2. Оптимизация: объединяем смежные стены
+            visited = np.zeros_like(maze, dtype=bool)
+            wall_rectangles = []
+            
+            # Сначала объединяем горизонтально
+            for y in range(h):
+                x = 0
+                while x < w:
+                    if maze[y, x] == 1 and not visited[y, x]:
+                        # Находим длину горизонтальной стены
+                        length = 1
+                        while x + length < w and maze[y, x + length] == 1 and not visited[y, x + length]:
+                            length += 1
+                        
+                        # Находим высоту (сколько строк имеют такую же стену)
+                        height = 1
+                        can_extend = True
+                        while y + height < h and can_extend:
+                            for i in range(length):
+                                if not (maze[y + height, x + i] == 1 and not visited[y + height, x + i]):
+                                    can_extend = False
+                                    break
+                            if can_extend:
+                                height += 1
+                        
+                        # Отмечаем как посещенное
+                        visited[y:y+height, x:x+length] = True
+                        wall_rectangles.append((x, y, length, height))
+                        
+                        x += length
+                    else:
+                        x += 1
+            
+            # 3. Создаем призмы для объединенных стен
+            vertex_offset = len(all_vertices)
+            
+            for x, y, length, height in wall_rectangles:
+                # Создаем одну большую призму вместо множества кубов
+                x_start = x * wall_width
+                y_start = y * wall_width
+                x_end = (x + length) * wall_width
+                y_end = (y + height) * wall_width
+                
+                wall_vertices = [
+                    [x_start, y_start, base_height],
+                    [x_end, y_start, base_height],
+                    [x_end, y_end, base_height],
+                    [x_start, y_end, base_height],
+                    [x_start, y_start, base_height + wall_height],
+                    [x_end, y_start, base_height + wall_height],
+                    [x_end, y_end, base_height + wall_height],
+                    [x_start, y_end, base_height + wall_height]
+                ]
+                
+                wall_faces = [
+                    [0, 3, 1], [1, 3, 2],  # низ
+                    [4, 5, 7], [5, 6, 7],  # верх
+                    [0, 1, 4], [1, 5, 4],  # бок 1
+                    [1, 2, 5], [2, 6, 5],  # бок 2
+                    [2, 3, 6], [3, 7, 6],  # бок 3
+                    [3, 0, 7], [0, 4, 7]   # бок 4
+                ]
+                
+                # Добавляем с учетом смещения
+                all_vertices.extend(wall_vertices)
+                for face in wall_faces:
+                    all_faces.append([v + vertex_offset for v in face])
+                
+                vertex_offset += 8
+            
+            logger.info(f"Создано {len(wall_rectangles)} объединенных стен (вместо {np.sum(maze == 1)} отдельных)")
+            
+            if len(wall_rectangles) == 0:
+                logger.warning("Нет стен для создания STL модели")
                 return None
             
-            # Выбираем лучшую маску
-            mask_data = masks.data.cpu().numpy()
+            # 4. Конвертируем в numpy массивы и создаем mesh
+            vertices_array = np.array(all_vertices, dtype=np.float32)
+            faces_array = np.array(all_faces, dtype=np.int32)
             
-            # Для каждой маски считаем площадь и качество
-            best_mask_idx = 0
-            best_score = -1
+            # Создаем STL mesh более эффективно
+            data = np.zeros(faces_array.shape[0], dtype=mesh.Mesh.dtype)
+            mesh_obj = mesh.Mesh(data, remove_empty_areas=False)
             
-            for i, mask in enumerate(mask_data):
-                # Площадь маски
-                area = mask.sum()
-                # Координаты ограничивающей рамки
-                rows = np.any(mask, axis=1)
-                cols = np.any(mask, axis=0)
-                ymin, ymax = np.where(rows)[0][[0, -1]] if np.any(rows) else (0, 0)
-                xmin, xmax = np.where(cols)[0][[0, -1]] if np.any(cols) else (0, 0)
-                bbox_area = (ymax - ymin) * (xmax - xmin)
-                
-                # Счет = площадь * компактность
-                compactness = area / bbox_area if bbox_area > 0 else 0
-                score = area * compactness
-                
-                if score > best_score:
-                    best_score = score
-                    best_mask_idx = i
+            # Заполняем векторы напрямую
+            for i, face in enumerate(faces_array):
+                mesh_obj.vectors[i] = vertices_array[face]
             
-            binary_mask = mask_data[best_mask_idx] > 0
-            
-            # Изменяем размер маски к исходному размеру изображения
-            if binary_mask.shape != (h, w):
-                binary_mask = cv2.resize(
-                    binary_mask.astype(np.uint8), 
-                    (w, h), 
-                    interpolation=cv2.INTER_NEAREST
-                ) > 0
-            
-            # Улучшаем качество маски
-            kernel = np.ones((7, 7), np.uint8)
-            binary_mask = cv2.morphologyEx(binary_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
-            
-            # Заполняем дыры
-            from scipy import ndimage
-            binary_mask = ndimage.binary_fill_holes(binary_mask)
-            
-            print(f"✅ Маска успешно создана, размер: {binary_mask.shape}, площадь: {binary_mask.sum()} пикселей")
-            return binary_mask > 0
+            return mesh_obj
             
         except Exception as e:
-            print(f"❌ Ошибка обработки изображения: {e}")
+            logger.error(f"Ошибка при создании STL: {e}")
             traceback.print_exc()
             return None
+    
+    @staticmethod
+    def save_stl(stl_mesh: mesh.Mesh, filepath: str) -> bool:
+        """Сохранение STL модели с проверками"""
+        try:
+            if stl_mesh is None:
+                return False
+            
+            stl_mesh.save(filepath)
+            
+            # Проверяем размер файла
+            file_size = os.path.getsize(filepath)
+            if file_size == 0:
+                logger.error("Создан пустой STL файл")
+                return False
+            
+            logger.info(f"STL сохранен: {filepath} ({file_size:,} байт)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения STL: {e}")
+            return False
 
-# ==================== ОСНОВНОЙ ПРОЦЕССОР ====================
-class MazeApp:
+# Улучшенный процессор для обработки изображений
+class EnhancedImageProcessor:
+    @staticmethod
+    def preprocess_image(image: np.ndarray) -> np.ndarray:
+        """Предварительная обработка изображения для консистентности"""
+        try:
+            # Если изображение с прозрачностью (RGBA), удаляем альфа-канал
+            if image.shape[2] == 4:
+                # Создаем белый фон
+                white_bg = np.ones_like(image[:, :, :3]) * 255
+                alpha = image[:, :, 3:4] / 255.0
+                image = (image[:, :, :3] * alpha + white_bg * (1 - alpha)).astype(np.uint8)
+            
+            # Конвертируем в RGB если нужно
+            if len(image.shape) == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            elif image.shape[2] == 3:
+                # Проверяем порядок каналов
+                if image[0, 0, 0] > image[0, 0, 2]:  # Если BGR вместо RGB
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            return image
+            
+        except Exception as e:
+            logger.error(f"Ошибка предобработки изображения: {e}")
+            return image if isinstance(image, np.ndarray) else np.zeros((100, 100, 3), dtype=np.uint8)
+
+    @staticmethod
+    def create_mask_from_image(image: np.ndarray, size: int, 
+                              auto_invert: bool = True,
+                              use_edge_detection: bool = False,
+                              threshold_method: str = "otsu") -> np.ndarray:
+        """
+        Создание маски из изображения с поддержкой разных форматов
+        
+        Параметры:
+        - auto_invert: автоматически инвертировать, если белый фон
+        - use_edge_detection: использовать детектирование границ для сложных изображений
+        - threshold_method: метод бинаризации ("otsu", "adaptive", "triangle")
+        """
+        try:
+            # 1. Предварительная обработка
+            processed = EnhancedImageProcessor.preprocess_image(image)
+            
+            # 2. Масштабирование
+            size = min(size, MAX_MAZE_SIZE)
+            processed = cv2.resize(processed, (size, size), interpolation=cv2.INTER_AREA)
+            
+            # 3. Конвертация в градации серого
+            if len(processed.shape) == 3:
+                gray = cv2.cvtColor(processed, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = processed
+            
+            # 4. Улучшение контраста (CLAHE)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+            
+            # 5. Размытие для уменьшения шума
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # 6. Бинаризация выбранным методом
+            if threshold_method == "adaptive":
+                binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                             cv2.THRESH_BINARY, 11, 2)
+            elif threshold_method == "triangle":
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)
+            else:  # "otsu" по умолчанию
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # 7. Детектирование границ для сложных изображений (опционально)
+            if use_edge_detection:
+                edges = cv2.Canny(gray, 50, 150)
+                # Заполняем внутренние области
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    edge_mask = np.zeros_like(binary)
+                    cv2.drawContours(edge_mask, contours, -1, 255, -1)
+                    # Комбинируем с бинаризацией
+                    binary = cv2.bitwise_and(binary, edge_mask)
+            
+            # 8. Автоматическое определение и инверсия если нужно
+            if auto_invert:
+                # Определяем, преобладает ли белый цвет (вероятно фон)
+                white_ratio = np.sum(binary > 127) / (size * size)
+                if white_ratio > 0.7:  # Если больше 70% белого
+                    binary = cv2.bitwise_not(binary)
+                    logger.info(f"Маска автоматически инвертирована (белый фон: {white_ratio:.2%})")
+            
+            # 9. Морфологические операции для улучшения маски
+            kernel = np.ones((3, 3), np.uint8)
+            
+            # Закрытие для заполнения мелких отверстий
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+            
+            # Открытие для удаления мелкого шума
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            # 10. Заполнение внутренних областей для контуров
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                filled_mask = np.zeros_like(binary)
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area > 100:  # Игнорируем очень маленькие контуры
+                        cv2.drawContours(filled_mask, [contour], 0, 255, -1)
+                binary = filled_mask
+            
+            # 11. Гауссово размытие и повторная бинаризация для сглаживания
+            binary = cv2.GaussianBlur(binary, (5, 5), 0)
+            _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+            
+            # 12. Убеждаемся, что есть достаточно белой области
+            white_pixels = np.sum(binary > 127)
+            if white_pixels < (size * size * 0.01):  # Менее 1% белого
+                logger.warning(f"Маска слишком темная, используем простую бинаризацию")
+                _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+            
+            # 13. Финальные морфологические операции
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            
+            return binary > 0
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания маски из изображения: {e}")
+            traceback.print_exc()
+            # Возвращаем простую маску по умолчанию
+            mask = np.ones((size, size), dtype=bool)
+            margin = size // 4
+            mask[margin:size-margin, margin:size-margin] = False
+            return mask
+
+    @staticmethod
+    def create_advanced_mask(image: np.ndarray, size: int, 
+                           method: str = 'auto',
+                           use_grabcut_refinement: bool = True,
+                           gaussian_blur_kernel: tuple = (5, 5),
+                           clahe_clip_limit: float = 2.0) -> np.ndarray:
+        """
+        УЛУЧШЕННОЕ создание маски для сложных изображений.
+        Особенно эффективно для черных, разнотонных и низкоконтрастных изображений.
+        
+        Параметры:
+        - method: 'auto', 'adaptive', 'edge_based', 'grabcut'
+        - use_grabcut_refinement: использовать GrabCut для уточнения маски
+        - gaussian_blur_kernel: размер ядра для размытия по Гауссу
+        - clahe_clip_limit: параметр CLAHE для улучшения контраста
+        """
+        try:
+            # 1. Предварительная обработка (универсальная)
+            processed = EnhancedImageProcessor.preprocess_image(image)
+            size = min(size, MAX_MAZE_SIZE)
+            processed = cv2.resize(processed, (size, size), interpolation=cv2.INTER_AREA)
+            
+            # 2. Улучшение контраста для сложных изображений
+            gray = cv2.cvtColor(processed, cv2.COLOR_RGB2GRAY)
+            
+            # Применяем CLAHE для улучшения локального контраста
+            clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
+            gray_enhanced = clahe.apply(gray)
+            
+            # Гауссово размытие для уменьшения шума
+            gray_blurred = cv2.GaussianBlur(gray_enhanced, gaussian_blur_kernel, 0)
+            
+            # 3. Автоматический выбор или применение указанного метода
+            if method == 'auto':
+                # Анализируем гистограмму для выбора метода
+                hist = cv2.calcHist([gray_blurred], [0], None, [256], [0, 256])
+                contrast = np.std(gray_blurred)  # Мера контраста
+                
+                if contrast < 25:  # Очень низкоконтрастное изображение
+                    mask = EnhancedImageProcessor._create_edge_based_mask(gray_blurred, processed)
+                elif np.argmax(hist) < 50 or np.argmax(hist) > 200:  # Очень тёмное или светлое
+                    mask = EnhancedImageProcessor._create_adaptive_mask(gray_blurred)
+                else:
+                    # Пробуем несколько методов и выбираем лучший
+                    masks = []
+                    masks.append(EnhancedImageProcessor._create_adaptive_mask(gray_blurred))
+                    masks.append(EnhancedImageProcessor._create_edge_based_mask(gray_blurred, processed))
+                    
+                    # Выбираем маску с наибольшей детализацией (но не шумом)
+                    best_mask = masks[0]
+                    best_score = 0
+                    
+                    for m in masks:
+                        contours, _ = cv2.findContours(m.astype(np.uint8), 
+                                                      cv2.RETR_EXTERNAL, 
+                                                      cv2.CHAIN_APPROX_SIMPLE)
+                        if contours:
+                            area = sum(cv2.contourArea(c) for c in contours)
+                            perimeter = sum(cv2.arcLength(c, True) for c in contours)
+                            if perimeter > 0:
+                                score = area / perimeter  # Мера "компактности"
+                                if score > best_score and area > size*size*0.01:
+                                    best_score = score
+                                    best_mask = m
+                    
+                    mask = best_mask
+            
+            elif method == 'adaptive':
+                mask = EnhancedImageProcessor._create_adaptive_mask(gray_blurred)
+            elif method == 'edge_based':
+                mask = EnhancedImageProcessor._create_edge_based_mask(gray_blurred, processed)
+            elif method == 'grabcut':
+                mask = EnhancedImageProcessor._create_grabcut_mask(processed)
+            else:
+                mask = EnhancedImageProcessor._create_adaptive_mask(gray_blurred)
+            
+            # 4. Уточнение маски с помощью GrabCut (если включено)
+            if use_grabcut_refinement and mask.any() and not mask.all():
+                mask = EnhancedImageProcessor._refine_with_grabcut(processed, mask)
+            
+            # 5. Постобработка маски
+            mask = mask.astype(np.uint8) * 255
+            
+            # Морфологические операции для очистки
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            # Заполнение внутренних областей
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                filled_mask = np.zeros_like(mask)
+                for contour in contours:
+                    if cv2.contourArea(contour) > 100:
+                        cv2.drawContours(filled_mask, [contour], 0, 255, -1)
+                mask = filled_mask
+            
+            return mask > 127
+            
+        except Exception as e:
+            logger.error(f"Ошибка в create_advanced_mask: {e}")
+            # Возвращаем простую маску по умолчанию
+            mask = np.ones((size, size), dtype=bool)
+            margin = size // 4
+            mask[margin:size-margin, margin:size-margin] = False
+            return mask
+
+    @staticmethod
+    def _create_adaptive_mask(gray: np.ndarray) -> np.ndarray:
+        """Создание маски с адаптивной бинаризацией"""
+        # Адаптивная бинаризация для изображений с переменным освещением
+        binary = cv2.adaptiveThreshold(gray, 255, 
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 11, 2)
+        
+        # Автоматическая инверсия при необходимости
+        if np.mean(binary) > 127:
+            binary = cv2.bitwise_not(binary)
+        
+        return binary > 127
+
+    @staticmethod
+    def _create_edge_based_mask(gray: np.ndarray, color_img: np.ndarray) -> np.ndarray:
+        """Создание маски на основе детекции границ"""
+        # Детекция границ Canny
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Расширение границ для соединения разрывов
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        edges = cv2.erode(edges, kernel, iterations=1)
+        
+        # Нахождение и заполнение контуров
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return np.zeros_like(gray, dtype=bool)
+        
+        # Создаем маску из самых больших контуров
+        mask = np.zeros_like(gray, dtype=np.uint8)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]  # Топ-3 контура
+        
+        for contour in contours:
+            if cv2.contourArea(contour) > gray.size * 0.001:  # Минимальная площадь
+                cv2.drawContours(mask, [contour], 0, 255, -1)
+        
+        return mask > 127
+
+    @staticmethod
+    def _create_grabcut_mask(image: np.ndarray) -> np.ndarray:
+        """Создание маски с помощью алгоритма GrabCut"""
+        # Инициализация маски для GrabCut
+        mask = np.zeros(image.shape[:2], np.uint8)
+        
+        # Прямоугольник по умолчанию (центр изображения)
+        h, w = image.shape[:2]
+        rect = (w//4, h//4, w//2, h//2)
+        
+        # Временные массивы для алгоритма
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        try:
+            # Применяем GrabCut
+            cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
+            
+            # Преобразуем маску в бинарную
+            mask_binary = np.where((mask == 2) | (mask == 0), 0, 1).astype(bool)
+            
+            # Если маска пустая или полная, пробуем другую инициализацию
+            if not mask_binary.any() or mask_binary.all():
+                mask[:] = 0
+                cv2.grabCut(image, mask, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+                mask_binary = np.where((mask == 2) | (mask == 0), 0, 1).astype(bool)
+            
+            return mask_binary
+        except:
+            return np.ones(image.shape[:2], dtype=bool)
+
+    @staticmethod
+    def _refine_with_grabcut(image: np.ndarray, initial_mask: np.ndarray) -> np.ndarray:
+        """Уточнение маски с помощью GrabCut"""
+        mask = np.zeros(image.shape[:2], np.uint8)
+        
+        # Устанавливаем начальную маску
+        mask[initial_mask] = cv2.GC_PR_FGD
+        mask[~initial_mask] = cv2.GC_PR_BGD
+        
+        # Устанавливаем уверенные области по краям
+        mask[0, :] = cv2.GC_BGD
+        mask[-1, :] = cv2.GC_BGD
+        mask[:, 0] = cv2.GC_BGD
+        mask[:, -1] = cv2.GC_BGD
+        
+        # Временные массивы
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        try:
+            cv2.grabCut(image, mask, None, bgd_model, fgd_model, 2, cv2.GC_INIT_WITH_MASK)
+            refined_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(bool)
+            return refined_mask
+        except:
+            return initial_mask
+
+# Основной процессор
+class MazeProcessor:
     def __init__(self):
         self.maze_gen = MazeGenerator()
-        self.shape_db = ShapeDatabase()
-        self.sam_processor = FastSAMProcessor()
-        self.setup_colors()
+        self.mask_gen = MaskGenerator()
+        self.stl_gen = OptimizedSTLGenerator()
+        self.img_processor = EnhancedImageProcessor()
+        self.temp_files = []
+        self.temp_lock = threading.Lock()
+        atexit.register(self.cleanup_temp_files)
     
-    def setup_colors(self):
-        self.COLORS = {
-            'wall': [30, 30, 30],
-            'path': [240, 240, 240],
-            'start': [76, 175, 80],
-            'end': [244, 67, 54],
-            'highlight': [33, 150, 243, 128]
-        }
+    def add_temp_file(self, filepath: str):
+        """Добавление временного файла с ограничением количества"""
+        with self.temp_lock:
+            self.temp_files.append(filepath)
+            if len(self.temp_files) > MAX_TEMP_FILES:
+                # Удаляем самые старые файлы
+                while len(self.temp_files) > MAX_TEMP_FILES // 2:
+                    old_file = self.temp_files.pop(0)
+                    try:
+                        if os.path.exists(old_file):
+                            os.unlink(old_file)
+                            logger.debug(f"Удален старый временный файл: {old_file}")
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить файл {old_file}: {e}")
     
-    def process(self, shape_name, uploaded_image, use_custom_image):
-        """Основная функция обработки"""
+    def cleanup_temp_files(self):
+        """Очистка временных файлов"""
+        with self.temp_lock:
+            for file_path in self.temp_files:
+                try:
+                    if os.path.exists(file_path):
+                        os.unlink(file_path)
+                        logger.debug(f"Очистка: удален {file_path}")
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить файл {file_path}: {e}")
+            self.temp_files.clear()
+    
+    def validate_inputs(self, image_size: int, wall_width_pixels: int) -> Tuple[bool, str]:
+        """Валидация входных параметров"""
+        if image_size < 100 or image_size > 5000:
+            return False, "Размер изображения должен быть от 100 до 5000 пикселей"
+        if wall_width_pixels < 1 or wall_width_pixels > 20:
+            return False, "Ширина стен должна быть от 1 до 20 пикселей"
+        return True, ""
+    
+    def process_maze(self, shape_name: str, uploaded_image=None, use_custom=False,
+                    image_size: int = DEFAULT_IMAGE_SIZE, wall_width_pixels: int = 2,
+                    mask_params: Dict = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """Создание лабиринта"""
         try:
-            print(f"\n{'='*50}")
-            print(f"🔄 Начало обработки")
-            print(f"{'='*50}")
+            # Валидация
+            is_valid, error_msg = self.validate_inputs(image_size, wall_width_pixels)
+            if not is_valid:
+                raise ValueError(error_msg)
             
-            if use_custom_image and uploaded_image is not None:
-                print(f"📷 Режим: пользовательское изображение")
-                print(f"📐 Размер изображения: {uploaded_image.shape}")
-                
-                binary_mask = self.sam_processor.process_image(uploaded_image)
-                
-                if binary_mask is None or not np.any(binary_mask):
-                    print("⚠️ FastSAM не смог обработать изображение, использую форму по умолчанию")
-                    binary_mask = self.shape_db.get_mask(shape_name)
-                else:
-                    print(f"✅ Маска создана успешно")
+            # Ограничиваем размер для производительности
+            image_size = min(image_size, MAX_MAZE_SIZE)
+            
+            # Параметры маски по умолчанию
+            if mask_params is None:
+                mask_params = {
+                    'auto_invert': True,
+                    'use_edge_detection': False,
+                    'threshold_method': 'otsu',
+                    'advanced_method': 'auto',
+                    'use_grabcut': True,
+                    'clahe_limit': 2.0
+                }
+            
+            # Создаем маску
+            if use_custom and uploaded_image is not None:
+                # Используем улучшенный метод для сложных изображений
+                mask = self.img_processor.create_advanced_mask(
+                    uploaded_image, 
+                    image_size,
+                    method=mask_params.get('advanced_method', 'auto'),
+                    use_grabcut_refinement=mask_params.get('use_grabcut', True),
+                    clahe_clip_limit=mask_params.get('clahe_limit', 2.0)
+                )
             else:
-                print(f"📐 Режим: предопределенная форма '{shape_name}'")
-                binary_mask = self.shape_db.get_mask(shape_name)
-                print(f"✅ Форма создана успешно")
+                mask = self.mask_gen.create_shape_mask(shape_name, image_size)
             
-            if binary_mask is None:
-                print("❌ Ошибка: маска не создана")
-                return self.create_error_image("Ошибка создания маски"), None
+            if mask is None or np.sum(mask) == 0:
+                raise ValueError("Не удалось создать маску. Попробуйте другое изображение или настройки.")
             
-            # Изменяем размер маски к стандартному размеру
-            binary_mask = cv2.resize(
-                binary_mask.astype(np.uint8), 
-                (IMAGE_SIZE, IMAGE_SIZE), 
-                interpolation=cv2.INTER_NEAREST
-            ) > 0
+            # Логируем статистику маски
+            mask_ratio = np.sum(mask) / (mask.shape[0] * mask.shape[1])
+            logger.info(f"Маска создана: {mask.shape}, заполнение: {mask_ratio:.2%}")
             
-            print(f"🌀 Генерация лабиринта...")
-            print(f"📊 Размер маски: {binary_mask.shape}")
-            print(f"📈 Площадь маски: {binary_mask.sum()} пикселей ({binary_mask.sum()/(IMAGE_SIZE*IMAGE_SIZE)*100:.1f}%)")
+            # Генерируем лабиринт
+            maze = self.maze_gen.generate_maze_in_mask(mask, wall_width_pixels)
             
-            maze = self.maze_gen.generate_inside_mask(binary_mask, CELL_SIZE)
+            # Визуализация
+            result_image = self.visualize_maze(maze, mask)
             
-            print(f"✅ Лабиринт сгенерирован успешно")
-            print(f"📊 Размер лабиринта: {maze.shape}")
-            print(f"📈 Проходов/стен: {np.sum(maze==0)}/{np.sum(maze==1)}")
+            # Статистика
+            stats = self._calculate_statistics(maze, mask)
             
-            result = self.visualize_maze(maze, binary_mask)
+            return result_image, maze, mask, stats
             
-            # Сохранение для скачивания
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_shape_name = "".join(c for c in shape_name if c.isalnum() or c in (' ', '_')).rstrip()
-            filename = f"maze_{safe_shape_name}_{timestamp}.png"
+        except Exception as e:
+            logger.error(f"Ошибка при обработке лабиринта: {e}")
+            traceback.print_exc()
+            error_image = self._create_error_image(str(e))
+            return error_image, None, None, {"error": str(e)}
+    
+    def visualize_maze(self, maze: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Визуализация лабиринта (оптимизированная)"""
+        h, w = maze.shape
+        
+        # Используем векторные операции вместо циклов
+        result = np.full((h, w, 3), [30, 30, 60], dtype=np.uint8)
+        result[mask] = [240, 240, 240]
+        result[maze == 1] = [20, 20, 20]
+        
+        return result
+    
+    def _calculate_statistics(self, maze: np.ndarray, mask: np.ndarray) -> Dict:
+        """Расчет статистики"""
+        try:
+            total_area = np.sum(mask)
+            wall_area = np.sum((maze == 1) & mask)
+            passage_area = np.sum((maze == 0) & mask)
             
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png", prefix="maze_")
+            if total_area > 0:
+                wall_percentage = (wall_area / total_area) * 100
+                passage_percentage = (passage_area / total_area) * 100
+            else:
+                wall_percentage = passage_percentage = 0
+            
+            return {
+                "Размер лабиринта": f"{maze.shape[1]} × {maze.shape[0]} пикселей",
+                "Общая площадь": f"{total_area:,} пикселей",
+                "Площадь стен": f"{wall_area:,} пикселей ({wall_percentage:.1f}%)",
+                "Площадь проходов": f"{passage_area:,} пикселей ({passage_percentage:.1f}%)",
+                "Отношение стен/проходов": f"{wall_area/max(passage_area, 1):.2f}"
+            }
+        except:
+            return {"error": "Не удалось рассчитать статистику"}
+    
+    def _create_error_image(self, message: str) -> np.ndarray:
+        """Изображение с ошибкой"""
+        img = np.zeros((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE, 3), dtype=np.uint8)
+        img[:] = [50, 50, 80]
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        lines = self._wrap_text(message, DEFAULT_IMAGE_SIZE - 100)
+        
+        for i, line in enumerate(lines):
+            text_size = cv2.getTextSize(line, font, 0.7, 1)[0]
+            text_x = (DEFAULT_IMAGE_SIZE - text_size[0]) // 2
+            text_y = DEFAULT_IMAGE_SIZE // 2 + i * 30 - len(lines) * 15
+            cv2.putText(img, line, (text_x, text_y), font, 0.7, (255, 200, 200), 1)
+        
+        return img
+    
+    def _wrap_text(self, text: str, max_width: int) -> List[str]:
+        """Разбивка текста"""
+        words = text.split()
+        lines = []
+        current_line = []
+        
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            if len(test_line) * 12 > max_width and current_line:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+            else:
+                current_line.append(word)
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        return lines[:4]
+    
+    def save_png(self, image: np.ndarray) -> Optional[str]:
+        """Сохранение PNG"""
+        try:
+            temp_file = tempfile.NamedTemporaryFile(
+                delete=False, 
+                suffix='.png', 
+                prefix=f'maze_{datetime.now().strftime("%H%M%S")}_'
+            )
             temp_path = temp_file.name
             temp_file.close()
             
-            cv2.imwrite(temp_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
-            print(f"💾 Лабиринт сохранен: {temp_path}")
-            print(f"✅ Обработка завершена успешно!")
-            print(f"{'='*50}\n")
+            cv2.imwrite(temp_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            self.add_temp_file(temp_path)
             
-            return result, temp_path
+            file_size = os.path.getsize(temp_path)
+            logger.info(f"PNG сохранен: {temp_path} ({file_size:,} байт)")
+            
+            return temp_path
             
         except Exception as e:
-            print(f"❌ Критическая ошибка: {e}")
-            traceback.print_exc()
-            return self.create_error_image(str(e)), None
+            logger.error(f"Ошибка сохранения PNG: {e}")
+            return None
     
-    def visualize_maze(self, maze, mask):
-        """Визуализирует лабиринт с цветовым кодированием"""
-        h, w = maze.shape
-        
-        # Создаем цветное изображение
-        colored = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        # Стены
-        colored[maze == 1] = self.COLORS['wall']
-        # Проходы
-        colored[maze == 0] = self.COLORS['path']
-        
-        # Находим и отмечаем старт и финиш
-        colored = self.add_start_end(colored, maze, mask)
-        
-        # Подсвечиваем границы формы
-        colored = self.highlight_shape(colored, mask)
-        
-        return colored
-    
-    def add_start_end(self, image, maze, mask):
-        """Добавляет старт и финиш в лучшие позиции"""
-        h, w = maze.shape
-        
-        # Ищем точки внутри маски
-        points = np.argwhere(mask & (maze == 0))
-        if len(points) < 2:
-            return image
-        
-        # Старт - точка с минимальным расстоянием до центра
-        center = np.array([h//2, w//2])
-        distances = np.linalg.norm(points - center, axis=1)
-        start_idx = np.argmin(distances)
-        start = tuple(points[start_idx])
-        
-        # Финиш - точка максимально удаленная от старта
-        start_point = np.array(start)
-        distances_to_start = np.linalg.norm(points - start_point, axis=1)
-        end_idx = np.argmax(distances_to_start)
-        end = tuple(points[end_idx])
-        
-        # Рисуем старт (зеленый)
-        y, x = start
-        radius = max(3, min(h, w) // 50)
-        cv2.circle(image, (x, y), radius, self.COLORS['start'][:3], -1)
-        cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
-        
-        # Рисуем финиш (красный)
-        y, x = end
-        cv2.circle(image, (x, y), radius, self.COLORS['end'][:3], -1)
-        cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
-        
-        return image
-    
-    def highlight_shape(self, image, mask):
-        """Подсвечивает границы формы"""
-        from scipy import ndimage
-        
-        # Находим контур
-        contour = mask & ~ndimage.binary_erosion(mask, structure=np.ones((3, 3)))
-        
-        # Рисуем контур синим цветом
-        contour_coords = np.where(contour)
-        for y, x in zip(*contour_coords):
-            # Плавное смешивание с текущим цветом
-            alpha = 0.3
-            current_color = image[y, x].astype(float)
-            highlight_color = np.array(self.COLORS['highlight'][:3])
-            image[y, x] = (current_color * (1 - alpha) + highlight_color * alpha).astype(np.uint8)
-        
-        return image
-    
-    def create_error_image(self, message):
-        """Создает изображение с сообщением об ошибке"""
-        img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
-        img[:] = [40, 40, 60]  # Темный фон
-        
+    def generate_stl(self, maze: np.ndarray, wall_height_mm: float = 15.0,
+                    wall_width_mm: float = 3.0, base_height_mm: float = 2.0,
+                    scale_factor: float = 1.0) -> Optional[str]:
+        """Генерация STL"""
         try:
-            # Добавляем текст ошибки
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            text = "ОШИБКА"
-            text_size = cv2.getTextSize(text, font, 1.5, 2)[0]
-            text_x = (IMAGE_SIZE - text_size[0]) // 2
-            text_y = IMAGE_SIZE // 2 - 30
-            cv2.putText(img, text, (text_x, text_y), font, 1.5, (255, 100, 100), 2, cv2.LINE_AA)
+            if maze is None:
+                logger.warning("Нет данных лабиринта для генерации STL")
+                return None
             
-            # Добавляем сообщение
-            if len(message) > 40:
-                message = message[:37] + "..."
-            msg_size = cv2.getTextSize(message, font, 0.7, 1)[0]
-            msg_x = (IMAGE_SIZE - msg_size[0]) // 2
-            msg_y = IMAGE_SIZE // 2 + 30
-            cv2.putText(img, message, (msg_x, msg_y), font, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+            # Проверяем, есть ли стены в лабиринте
+            wall_count = np.sum(maze == 1)
+            if wall_count == 0:
+                logger.warning("Нет стен в лабиринте для создания STL")
+                return None
             
-        except:
-            pass
+            logger.info(f"Начинаем генерацию STL для лабиринта с {wall_count} стен...")
+            start_time = time.time()
+            
+            stl_mesh = self.stl_gen.maze_to_stl_optimized(
+                maze, wall_height_mm, wall_width_mm, base_height_mm, scale_factor)
+            
+            if stl_mesh is None:
+                return None
+            
+            temp_file = tempfile.NamedTemporaryFile(
+                delete=False, 
+                suffix='.stl', 
+                prefix=f'maze_3d_{datetime.now().strftime("%H%M%S")}_'
+            )
+            temp_path = temp_file.name
+            temp_file.close()
+            
+            if self.stl_gen.save_stl(stl_mesh, temp_path):
+                self.add_temp_file(temp_path)
+                elapsed = time.time() - start_time
+                logger.info(f"STL сгенерирован за {elapsed:.2f} секунд")
+                return temp_path
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка генерации STL: {e}")
+            traceback.print_exc()
+            return None
+
+# Интерфейс Gradio с улучшенными настройками маски
+def create_gradio_interface():
+    processor = MazeProcessor()
+    
+    with gr.Blocks(title="Улучшенный генератор лабиринтов с STL", theme=gr.themes.Soft()) as interface:
+        maze_state = gr.State()
+        mask_state = gr.State()
         
-        return img
-
-# ==================== GRADIO ИНТЕРФЕЙС ====================
-def create_interface():
-    """Создает веб-интерфейс"""
-    app = MazeApp()
-
-    with gr.Blocks(title="Генератор лабиринтов с FastSAM", theme=gr.themes.Soft()) as interface:
-        gr.Markdown(""" 
-        # 🧩 Генератор лабиринтов в произвольной форме
-        ### Создавайте красивые лабиринты внутри любых форм!
+        gr.Markdown("""
+        # 🧩 УЛУЧШЕННЫЙ ГЕНЕРАТОР ЛАБИРИНТОВ С STL ЭКСПОРТОМ
+        Поддержка любых форматов изображений и улучшенное создание масок
         """)
         
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### ⚙️ Настройки")
+                gr.Markdown("### ⚙️ Основные настройки")
                 
                 shape_dropdown = gr.Dropdown(
                     choices=PREDEFINED_SHAPES,
-                    value="Сердце",
-                    label="📐 Выберите форму",
+                    value="Звезда",
+                    label="Выберите форму",
                     interactive=True
                 )
                 
                 use_custom = gr.Checkbox(
-                    label="🖼️ Использовать свое изображение",
-                    value=False,
-                    interactive=True
+                    label="Использовать свое изображение",
+                    value=False
                 )
                 
                 image_input = gr.Image(
                     type="numpy",
-                    label="📤 Загрузите изображение",
+                    label="Загрузите изображение (любой формат: JPG, PNG, BMP, SVG и т.д.)",
                     height=200,
                     visible=False
                 )
                 
-                gr.Markdown("### 🎨 Цветовая схема")
-                gr.Markdown("""
-                - 🟩 **Зеленый** - старт лабиринта
-                - 🟥 **Красный** - финиш лабиринта
-                - 🔵 **Синий** - границы формы
-                - ⬛ **Темный** - стены лабиринта
-                - ⬜ **Светлый** - проходы лабиринта
-                """)
+                gr.Markdown("### 🎛️ Настройки маски (только для своих изображений)")
+                
+                with gr.Accordion("Расширенные настройки маски", open=False):
+                    auto_invert = gr.Checkbox(
+                        label="Автоматическая инверсия (если белый фон)",
+                        value=True
+                    )
+                    
+                    use_edge_detection = gr.Checkbox(
+                        label="Использовать детектирование границ",
+                        value=False,
+                        info="Полезно для изображений со сложными границами"
+                    )
+                    
+                    threshold_method = gr.Radio(
+                        choices=["otsu", "adaptive", "triangle"],
+                        value="otsu",
+                        label="Метод бинаризации"
+                    )
+                
+                gr.Markdown("### 🛠️ Улучшенные настройки для сложных изображений")
+                
+                with gr.Accordion("🛠️ Улучшенные настройки для сложных изображений", open=False):
+                    advanced_method = gr.Radio(
+                        choices=["auto", "adaptive", "edge_based", "grabcut"],
+                        value="auto",
+                        label="Метод создания маски"
+                    )
+                    
+                    use_grabcut = gr.Checkbox(
+                        label="Использовать GrabCut для уточнения",
+                        value=True
+                    )
+                    
+                    clahe_limit = gr.Slider(
+                        minimum=1.0,
+                        maximum=4.0,
+                        value=2.0,
+                        step=0.5,
+                        label="Интенсивность улучшения контраста (CLAHE)"
+                    )
+                
+                gr.Markdown("### 🎛️ Параметры лабиринта")
+                
+                image_size = gr.Slider(
+                    minimum=200,
+                    maximum=MAX_MAZE_SIZE,
+                    value=min(DEFAULT_IMAGE_SIZE, MAX_MAZE_SIZE),
+                    step=100,
+                    label=f"Размер изображения (пиксели, макс: {MAX_MAZE_SIZE})"
+                )
+                
+                wall_width_pixels = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=2,
+                    step=1,
+                    label="Ширина стен (пиксели)"
+                )
                 
                 generate_btn = gr.Button(
                     "🎲 Сгенерировать лабиринт",
@@ -660,132 +1103,228 @@ def create_interface():
                     size="lg"
                 )
                 
-                download_btn = gr.File(
-                    label="💾 Скачать лабиринт (PNG)",
+                gr.Markdown("### 🖨️ Настройки 3D экспорта")
+                
+                wall_height_mm = gr.Slider(
+                    minimum=1,
+                    maximum=50,
+                    value=DEFAULT_WALL_HEIGHT_MM,
+                    step=1,
+                    label="Высота стен (мм)"
+                )
+                
+                wall_width_mm = gr.Slider(
+                    minimum=0.5,
+                    maximum=10,
+                    value=DEFAULT_WALL_WIDTH_MM,
+                    step=0.5,
+                    label="Ширина стен (мм)"
+                )
+                
+                base_height_mm = gr.Slider(
+                    minimum=0,
+                    maximum=10,
+                    value=DEFAULT_BASE_HEIGHT_MM,
+                    step=0.5,
+                    label="Высота основания (мм)"
+                )
+                
+                scale_factor = gr.Slider(
+                    minimum=0.1,
+                    maximum=2.0,
+                    value=1.0,
+                    step=0.1,
+                    label="Масштаб модели"
+                )
+                
+                gr.Markdown("*Примечание: размер модели автоматически корректируется для 3D печати*")
+                
+                export_stl_btn = gr.Button(
+                    "🔄 Сгенерировать STL",
+                    variant="secondary"
+                )
+                
+                gr.Markdown("### 💾 Скачать")
+                
+                download_png = gr.File(
+                    label="Скачать PNG",
                     visible=False
                 )
                 
-                gr.Markdown("""
-                ---
-                ### 💡 Советы:
-                1. Для лучших результатов используйте изображения с четким объектом на контрастном фоне
-                2. Изображения должны быть не менее 300x300 пикселей
-                3. Сложные формы могут требовать больше времени для обработки
-                """)
+                download_stl = gr.File(
+                    label="Скачать STL",
+                    visible=False
+                )
                 
+                gr.Markdown("### 📊 Статистика")
+                stats_output = gr.JSON(
+                    label="Статистика лабиринта",
+                    value={}
+                )
+                
+                gr.Markdown("""
+                ### 🆕 Улучшения обработки изображений:
+                - Поддержка любых форматов: JPG, PNG, BMP, GIF, TIFF, SVG
+                - Автоматическая обработка прозрачности
+                - Улучшение контраста (CLAHE)
+                - Умная инверсия для светлого фона
+                - Детектирование границ для сложных изображений
+                - Заполнение внутренних областей
+                - **НОВОЕ**: Расширенная обработка черных и разнотонных изображений
+                - **НОВОЕ**: Алгоритм GrabCut для точной сегментации
+                - **НОВОЕ**: Автоматический выбор лучшего метода
+                """)
+            
             with gr.Column(scale=2):
                 gr.Markdown("### 🎯 Результат")
                 output_image = gr.Image(
-                    label="Сгенерированный лабиринт", 
-                    height=500,
+                    label="Сгенерированный лабиринт",
+                    height=600,
                     type="numpy"
                 )
                 
-                with gr.Accordion("📊 Информация о обработке", open=False):
-                    info_text = gr.Textbox(
-                        label="Лог обработки",
-                        lines=5,
-                        interactive=False
-                    )
+                gr.Markdown("### 👁️ Предпросмотр маски")
+                mask_preview = gr.Image(
+                    label="Созданная маска",
+                    height=300,
+                    type="numpy",
+                    visible=False
+                )
         
-        # Функции
-        def toggle_visibility(use_custom_val):
-            return {
-                shape_dropdown: gr.update(interactive=not use_custom_val),
-                image_input: gr.update(visible=use_custom_val)
-            }
+        def toggle_image_input(use_custom_val):
+            return gr.update(visible=use_custom_val), gr.update(interactive=not use_custom_val)
         
-        def process_wrapper(shape_name, uploaded_image, use_custom_image):
-            result, file_path = app.process(shape_name, uploaded_image, use_custom_image)
-            return result, file_path, f"Обработка завершена. Файл сохранен: {file_path if file_path else 'Ошибка'}"
+        def generate_maze(shape_name, uploaded_image, use_custom, img_size, wall_width,
+                         auto_invert, use_edge_detection, threshold_method,
+                         advanced_method, use_grabcut, clahe_limit):
+            try:
+                start_time = time.time()
+                
+                # Подготавливаем параметры маски
+                mask_params = {
+                    'auto_invert': auto_invert,
+                    'use_edge_detection': use_edge_detection,
+                    'threshold_method': threshold_method,
+                    'advanced_method': advanced_method,
+                    'use_grabcut': use_grabcut,
+                    'clahe_limit': clahe_limit
+                }
+                
+                result_image, maze, mask, stats = processor.process_maze(
+                    shape_name, uploaded_image, use_custom, img_size, wall_width, mask_params
+                )
+                
+                process_time = time.time() - start_time
+                
+                if "error" not in stats:
+                    stats["Время генерации"] = f"{process_time:.2f} сек"
+                    stats["Оптимизация"] = "Включена (объединение стен)"
+                    stats["Метод маски"] = advanced_method
+                
+                png_path = processor.save_png(result_image) if result_image is not None else None
+                
+                # Создаем предпросмотр маски
+                mask_preview_img = None
+                if mask is not None:
+                    mask_preview_img = np.zeros((*mask.shape, 3), dtype=np.uint8)
+                    mask_preview_img[mask] = [255, 255, 255]
+                
+                return (result_image, maze, mask, stats, png_path, None,
+                       mask_preview_img, gr.update(visible=mask is not None))
+                
+            except Exception as e:
+                error_msg = f"Ошибка: {str(e)}"
+                logger.error(error_msg)
+                error_image = processor._create_error_image(error_msg)
+                return (error_image, None, None, {"error": error_msg}, None, None,
+                       None, gr.update(visible=False))
         
-        # Обработчики событий
+        def generate_stl_file(maze, wall_height, wall_width, base_height, scale):
+            try:
+                if maze is None:
+                    return None, gr.update(visible=False)
+                
+                stl_path = processor.generate_stl(
+                    maze, wall_height, wall_width, base_height, scale
+                )
+                
+                return stl_path, gr.update(visible=stl_path is not None)
+                
+            except Exception as e:
+                error_msg = f"Ошибка генерации STL: {str(e)}"
+                logger.error(error_msg)
+                return None, gr.update(visible=False)
+        
+        def update_download_visibility(png_path, stl_path):
+            return (
+                gr.update(visible=png_path is not None, value=png_path),
+                gr.update(visible=stl_path is not None, value=stl_path)
+            )
+        
         use_custom.change(
-            fn=toggle_visibility,
+            fn=toggle_image_input,
             inputs=use_custom,
-            outputs=[shape_dropdown, image_input]
+            outputs=[image_input, shape_dropdown]
         )
         
         generate_btn.click(
-            fn=process_wrapper,
-            inputs=[shape_dropdown, image_input, use_custom],
-            outputs=[output_image, download_btn, info_text]
+            fn=generate_maze,
+            inputs=[shape_dropdown, image_input, use_custom, image_size, wall_width_pixels,
+                   auto_invert, use_edge_detection, threshold_method,
+                   advanced_method, use_grabcut, clahe_limit],
+            outputs=[output_image, maze_state, mask_state, stats_output, download_png, 
+                    download_stl, mask_preview, mask_preview]
         ).then(
-            fn=lambda file_path: gr.update(visible=file_path is not None),
-            inputs=[download_btn],
-            outputs=[download_btn]
+            fn=update_download_visibility,
+            inputs=[download_png, download_stl],
+            outputs=[download_png, download_stl]
         )
         
-        # Загрузка интерфейса
-        interface.load(
-            fn=lambda: None,
-            inputs=None,
-            outputs=None,
-            _js="""
-            () => {
-                console.log('✅ Интерфейс загружен!');
-                alert('Готов к работе! Выберите форму или загрузите изображение.');
-            }
-            """
+        export_stl_btn.click(
+            fn=generate_stl_file,
+            inputs=[maze_state, wall_height_mm, wall_width_mm, base_height_mm, scale_factor],
+            outputs=[download_stl, download_stl]
         )
-
+    
     return interface
 
 def main():
-    """
-    Основная функция для запуска приложения
-    """
-    print("=" * 60)
-    print("🧩 Генератор лабиринтов с FastSAM - УЛУЧШЕННАЯ ВЕРСИЯ")
-    print("=" * 60)
+    print("=" * 70)
+    print("🧩 УЛУЧШЕННЫЙ ГЕНЕРАТОР ЛАБИРИНТОВ С STL")
+    print("=" * 70)
+    print(f"Python: {sys.version}")
+    print(f"OpenCV: {cv2.__version__}")
+    print(f"NumPy: {np.__version__}")
     
-    # Проверка зависимостей
+    print("\n✅ Улучшения:")
+    print("   1. Поддержка всех форматов изображений (JPG, PNG, BMP, GIF, TIFF, SVG)")
+    print("   2. Автоматическая обработка прозрачности")
+    print("   3. Улучшение контраста (CLAHE)")
+    print("   4. Умное определение фона и инверсия")
+    print("   5. Детектирование границ для сложных изображений")
+    print("   6. Заполнение внутренних областей контуров")
+    print("   7. НОВОЕ: Расширенная обработка черных и разнотонных изображений")
+    print("   8. НОВОЕ: Алгоритм GrabCut для точной сегментации")
+    print("   9. НОВОЕ: Автоматический выбор лучшего метода")
+    
+    print("\n🚀 Запуск интерфейса...")
+    print("   Откройте браузер: http://localhost:7860")
+    print("   Для остановки: Ctrl+C\n")
+    
     try:
-        import scipy
-        print(f"✅ SciPy установлена: {scipy.__version__}")
-    except ImportError:
-        print("❌ SciPy не установлена! Установите: pip install scipy")
-        return
-    
-    try:
-        import ultralytics
-        print(f"✅ Ultralytics установлен: {ultralytics.__version__}")
-    except ImportError:
-        print("❌ Ultralytics не установлен! Установите: pip install ultralytics")
-        print("   Это необходимо для работы FastSAM")
-    
-    # Проверка модели FastSAM
-    if not Path(MODEL_PATH).exists():
-        print(f"\n⚠️  Внимание: файл модели '{MODEL_PATH}' не найден!")
-        print("\n📥  Чтобы исправить это:")
-        print("   1. Скачайте модель FastSAM-s.pt по ссылке:")
-        print("      https://github.com/CASIA-IVA-Lab/FastSAM/releases/download/v0.1/FastSAM-s.pt")
-        print("   2. Поместите скачанный файл в папку с этим скриптом.")
-        print(f"      Текущая папка: {Path.cwd()}")
-        print("\n⚠️  Приложение будет работать только с предопределенными формами.")
-        print("   Для обработки изображений требуется модель FastSAM.\n")
-    
-    print("\n🚀  Запуск веб-интерфейса...")
-    print("   Откройте браузер и перейдите по адресу: http://localhost:7860")
-    print("   Для остановки сервера нажмите Ctrl+C\n")
-    
-    # Запуск интерфейса
-    try:
-        interface = create_interface()
+        interface = create_gradio_interface()
         interface.launch(
             server_name="0.0.0.0",
             server_port=7860,
             share=False,
-            show_error=True,
-            debug=False
+            show_error=True
         )
     except Exception as e:
-        print(f"❌  Не удалось запустить приложение. Ошибка: {e}")
-        print("\n🔧  Возможные причины:")
-        print("   - Порт 7860 занят (попробуйте другой порт)")
-        print("   - Проблема с установкой Gradio")
-        print("   - Ошибка в коде интерфейса")
+        print(f"❌ Ошибка: {e}")
+        traceback.print_exc()
+        return 1
+    
+    return 0
 
-# ==================== ТОЧКА ВХОДА ====================
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
